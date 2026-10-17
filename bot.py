@@ -60,6 +60,9 @@ UA = ("Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
 
 log = logging.getLogger("hindibot")
 STOP = threading.Event()
+FATAL = threading.Event()          # set when the token is rejected: exit code 1, no auto-restart
+MAX_RUNTIME_MIN = float(os.environ.get("MAX_RUNTIME_MIN", "0") or 0)   # 0 = run forever
+DRAIN_MIN = float(os.environ.get("DRAIN_MIN", "12") or 12)
 
 # --------------------------------------------------------------------------
 # Errors
@@ -2001,6 +2004,17 @@ class Bot:
             job.finish_text("⚠️ The bot is shutting down. Please send the file again in a minute.")
             self.finish_job(job)
 
+    def wait_idle(self, seconds):
+        """Wait until every running job is finished (or the time is up)."""
+        end = time.time() + seconds
+        while time.time() < end and not STOP.is_set():
+            with self.lock:
+                if not self.jobs:
+                    return True
+            time.sleep(1.0)
+        with self.lock:
+            return not self.jobs
+
     def shutdown(self):
         with self.lock:
             jobs = list(self.jobs.values())
@@ -2054,10 +2068,13 @@ class _Redact(logging.Filter):
         return True
 
 
-def poll_loop(bot, tg):
+def poll_loop(bot, tg, deadline=None):
+    """Returns (next_offset, timed_out)."""
     offset = None
     last_conflict = 0.0
     while not STOP.is_set():
+        if deadline is not None and time.time() >= deadline:
+            return offset, True
         params = {"timeout": 25, "allowed_updates": ["message", "callback_query"]}
         if offset is not None:
             params["offset"] = offset
@@ -2066,8 +2083,9 @@ def poll_loop(bot, tg):
         except TelegramError as exc:
             if exc.code == 401:
                 log.error("Telegram says the BOT_TOKEN is not valid. Stopping.")
+                FATAL.set()
                 STOP.set()
-                return
+                return offset, False
             if exc.code == 409:
                 if time.time() - last_conflict > 60:
                     log.warning("Another copy of this bot is polling with the same token. Waiting...")
@@ -2090,6 +2108,7 @@ def poll_loop(bot, tg):
                 bot.handle_update(upd)
             except Exception:
                 log.error("update crashed:\n%s", traceback.format_exc())
+    return offset, False
 
 
 def main():
@@ -2129,11 +2148,22 @@ def main():
         signal.signal(signal.SIGTERM, _stop)
     except (ValueError, AttributeError, OSError):
         pass
-    poll_loop(bot, tg)
+    deadline = time.time() + MAX_RUNTIME_MIN * 60 if MAX_RUNTIME_MIN > 0 else None
+    offset, timed_out = poll_loop(bot, tg, deadline)
+    if timed_out:
+        log.info("time limit reached: no new files, finishing running jobs (up to %d min)", DRAIN_MIN)
+        try:        # confirm what we already handled so the next copy does not repeat it
+            if offset is not None:
+                for upd in tg.call("getUpdates", {"offset": offset, "limit": 1, "timeout": 0},
+                                   timeout=20, retries=1) or []:
+                    bot.handle_update(upd)
+        except TelegramError as exc:
+            log.warning("final confirm failed: %s", exc)
+        bot.wait_idle(DRAIN_MIN * 60)
     log.info("stopping...")
     bot.shutdown()
     time.sleep(1.0)
-    return 0
+    return 1 if FATAL.is_set() else 0
 
 
 if __name__ == "__main__":
