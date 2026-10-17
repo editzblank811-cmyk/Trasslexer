@@ -724,6 +724,38 @@ class EndToEndTests(unittest.TestCase):
         finally:
             fake.close()
 
+    def test_time_limit_drains_running_jobs_then_stops(self):
+        text = "\n".join(f"第{i}行：这是测试内容。" for i in range(200)).encode("utf-8")
+        fake = FakeTelegram(text, "d.txt")
+        tg = bot.TgClient(fake.token, fake.url)
+        slow = FakeEngine("slow", threads=4, max_items=4)
+        orig = slow.translate
+
+        def slow_translate(texts, sl):
+            time.sleep(0.15)
+            return orig(texts, sl)
+        slow.translate = slow_translate
+        b = bot.Bot(tg, [slow])
+        result = {}
+
+        def poll():
+            result["r"] = bot.poll_loop(b, tg, time.time() + 2.0)
+        t = threading.Thread(target=poll, daemon=True)
+        t.start()
+        try:
+            t.join(timeout=30)
+            self.assertFalse(t.is_alive())
+            offset, timed_out = result["r"]
+            self.assertTrue(timed_out)
+            self.assertEqual(offset, 2)
+            self.assertTrue(b.jobs)                     # job still running when polling stopped
+            self.assertTrue(b.wait_idle(60))            # ...and it is allowed to finish
+            self.assertEqual(list(fake.uploaded_files()), ["d_hindi.txt"])
+        finally:
+            bot.STOP.set()
+            b.shutdown()
+            fake.close()
+
     def test_cancel_button(self):
         text = "\n".join(f"第{i}行：这是测试内容。" for i in range(3000)).encode("utf-8")
         cb = {"update_id": 9, "callback_query": {"id": "cb1", "data": "c:NOPE", "message": {"chat": {"id": 777}}}}
