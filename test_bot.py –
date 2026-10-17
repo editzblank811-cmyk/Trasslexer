@@ -1,0 +1,763 @@
+# -*- coding: utf-8 -*-
+"""Tests. Run:  python -m unittest -v
+Everything runs offline against fake local servers, no internet needed."""
+import io
+import json
+import os
+import re
+import tempfile
+import threading
+import time
+import unittest
+import urllib.parse
+import zipfile
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import bot
+
+
+def fake_tr(s):
+    """Pretend translator: every letter becomes a Devanagari letter."""
+    return "".join(chr(0x0905 + ord(c) % 40) if c.isalpha() else c for c in s)
+
+
+# ----------------------------------------------------------------- fake engines
+class FakeEngine(bot.Engine):
+    def __init__(self, name, tier=0, threads=3, max_items=8, mode="ok", rescue_only=False):
+        super().__init__()
+        self.name = name
+        self.tier = tier
+        self.threads = threads
+        self.max_items = max_items
+        self.item_limit = max_items
+        self.mode = mode
+        self.rescue_only = rescue_only
+        self.calls = 0
+        self.t_start = time.time()
+
+    def translate(self, texts, sl):
+        self.calls += 1
+        if self.mode == "ok":
+            return [fake_tr(t) for t in texts]
+        if self.mode == "misalign":
+            if len(texts) > 1:
+                raise bot.AlignError()
+            return [fake_tr(texts[0])]
+        if self.mode == "flaky":
+            if self.calls % 3 == 0:
+                raise bot.EngineError("boom")
+            return [fake_tr(t) for t in texts]
+        if self.mode == "untranslated":
+            return list(texts)
+        if self.mode == "dead":
+            raise bot.EngineError("down", rate=True)
+        if self.mode == "crash":
+            raise ValueError("bug in engine")
+        if self.mode == "outage":     # whole service down for the first 2.5 seconds
+            if time.time() - self.t_start < 2.5:
+                raise bot.EngineError("network: unreachable")
+            return [fake_tr(t) for t in texts]
+        if self.mode == "poison":     # any request containing 毒 fails (like a text an engine chokes on)
+            if any("毒" in t for t in texts):
+                raise bot.EngineError("HTTP 500")
+            return [fake_tr(t) for t in texts]
+        if self.mode == "stubborn":  # leaves lines containing 特 untranslated unless short
+            return [t if ("特" in t and len(t) > 80) else fake_tr(t) for t in texts]
+        raise AssertionError(self.mode)
+
+
+class HelperTests(unittest.TestCase):
+    def test_split_pieces_keeps_all_text(self):
+        text = "你好，世界。" * 500
+        pieces = bot.split_pieces(text, 100)
+        self.assertTrue(all(len(p) <= 100 for p in pieces))
+        self.assertEqual(re.sub(r"\s", "", "".join(pieces)), text)
+        words = " ".join(["word"] * 900)
+        pieces = bot.split_pieces(words, 100)
+        self.assertTrue(all(len(p) <= 100 for p in pieces))
+        self.assertEqual(" ".join(pieces).split(), words.split())
+        self.assertEqual(bot.split_pieces("短", 100), ["短"])
+        blob = "x" * 3000
+        self.assertEqual("".join(bot.split_pieces(blob, 1000)), blob)
+
+    def test_split_aligned(self):
+        self.assertEqual(bot.split_aligned("a\nb\n", 2), ["a", "b"])
+        with self.assertRaises(bot.AlignError):
+            bot.split_aligned("a\nb\nc", 2)
+        self.assertEqual(bot.split_aligned("a\nb", 1), ["a b"])
+
+    def test_scores(self):
+        self.assertEqual(bot.leftover_score("你好", "नमस्ते"), 0.0)
+        self.assertGreater(bot.leftover_score("你好", "你好"), 0)
+        self.assertGreater(bot.leftover_score("你好", "नमस्ते 你好"), 0)
+        self.assertGreater(bot.leftover_score("hello", ""), 0)
+        self.assertGreater(bot.leftover_score("some english line here", "some english line here"), 0)
+        self.assertEqual(bot.final_flag("नमस्ते दुनिया"), None)
+        self.assertEqual(bot.final_flag("Zhang Wei"), "kept")
+        self.assertEqual(bot.final_flag("这是没有翻译的中文"), "problem")
+        self.assertEqual(bot.final_flag("This sentence was never translated at all, sorry"), "problem")
+        self.assertEqual(bot.final_flag("1234 ..."), None)
+
+    def test_detect_source(self):
+        self.assertEqual(bot.detect_source(["你好世界，这是测试"]), "zh")
+        self.assertEqual(bot.detect_source(["This is a normal English sentence."]), "en")
+        self.assertEqual(bot.detect_source(["123 456"]), "auto")
+
+    def test_decode(self):
+        gbk = "你好，世界".encode("gb18030")
+        self.assertEqual(bot.decode_text(gbk), "你好，世界")
+        self.assertEqual(bot.decode_text("你好".encode("utf-8-sig")), "你好")
+        self.assertEqual(bot.decode_text("你好".encode("utf-16")), "你好")
+        self.assertEqual(bot.decode_text("你好".encode("big5")), "你好")
+
+    def test_markup_roundtrip_is_lossless(self):
+        doc = ('<?xml version="1.0" encoding="utf-8"?><!DOCTYPE html>'
+               '<html xmlns="http://www.w3.org/1999/xhtml" lang="zh-CN"><head><title>书</title>'
+               '<style>p{color:red} /* <b> */</style></head><body>'
+               '<!-- 注释 <p>x</p> --><p class="a>b">第一章 &amp; &lt;你好&gt; <b>世界</b></p>'
+               '<pre>  行一\n  line two\n</pre><script>if (a<b) {document.write("<p>你</p>")}</script>'
+               '<p>12345</p><p>&#160;</p><![CDATA[ 你好 ]]></body></html>')
+        table = bot.SegTable()
+        parts = bot.parse_markup(doc, bot.make_translate_handler(table))
+        ident = bot.render_parts(parts, [t for t in table.texts])
+        self.assertEqual(ident.replace('lang="hi"', 'lang="zh-CN"'), doc)
+        self.assertIn("书", table.texts)
+        # script/style/comment/CDATA text must not become segments
+        joined = " ".join(table.texts)
+        self.assertNotIn("color", joined)
+        self.assertNotIn("document", joined)
+        self.assertNotIn("注释", joined)
+        # pre lines are separate segments
+        self.assertIn("行一", table.texts)
+        self.assertIn("line two", table.texts)
+        # translated render keeps entities escaped
+        tr = [fake_tr(t) for t in table.texts]
+        out = bot.render_parts(parts, tr)
+        self.assertIn("&amp;", out)
+        self.assertIn("&lt;", out)
+        self.assertIn("</script>", out)
+
+    def test_translated_xhtml_stays_well_formed(self):
+        import xml.dom.minidom
+        doc = ('<?xml version="1.0" encoding="utf-8"?>'
+               '<html xmlns="http://www.w3.org/1999/xhtml" lang="zh-CN"><head><title>书</title>'
+               '<style>p{color:red}</style></head><body>'
+               '<p class="a>b">第一章 &amp; &lt;你好&gt; <b>世界</b> 结束。</p>'
+               '<pre>  行一\n  line two\n</pre>'
+               '<script><![CDATA[ if (a<b) { x("<p>你</p>") } ]]></script>'
+               '<p>12345</p><p>&#160;</p></body></html>')
+        xml.dom.minidom.parseString(doc.encode("utf-8"))      # sample itself is valid
+        table = bot.SegTable()
+        parts = bot.parse_markup(doc, bot.make_translate_handler(table))
+        out = bot.render_parts(parts, [fake_tr(t) for t in table.texts])
+        xml.dom.minidom.parseString(out.encode("utf-8"))
+        self.assertNotRegex(out.split("<script>")[0], bot.CJK_RE)
+
+    def test_clean_result_removes_bad_xml_chars(self):
+        self.assertEqual(bot.clean_result("a\x0bb\x00 c\n d"), "ab c d")
+
+
+class RunTests(unittest.TestCase):
+    def make_texts(self, n=300):
+        texts = []
+        for i in range(n):
+            texts.append(f"第{i}章 这是一个测试句子，用来检查翻译是否完整。" * (1 + i % 3))
+        return texts
+
+    def run_run(self, engines, texts, **kw):
+        run = bot.Run(texts, engines, "zh", threading.Event(), **kw)
+        run.execute()
+        return run
+
+    def test_all_good(self):
+        texts = self.make_texts()
+        run = self.run_run([FakeEngine("a"), FakeEngine("b", threads=2)], texts)
+        res = run.results()
+        self.assertEqual(res, [fake_tr(t) for t in texts])
+        self.assertEqual(run.done_count, len(texts))
+        self.assertEqual(run.bad_indexes(), [])
+
+    def test_mixed_flaky_engines_still_perfect(self):
+        texts = self.make_texts()
+        engines = [FakeEngine("ok"), FakeEngine("flaky", mode="flaky"),
+                   FakeEngine("misalign", mode="misalign"), FakeEngine("dead", mode="dead"),
+                   FakeEngine("crash", mode="crash"), FakeEngine("lazy", mode="untranslated")]
+        run = self.run_run(engines, texts)
+        res = run.results()
+        self.assertEqual(res, [fake_tr(t) for t in texts])
+        self.assertEqual(run.bad_indexes(), [])
+        for e in engines:
+            if e.name == "ok":
+                continue
+            self.assertEqual(run.engine_chars[e.name] if e.name not in ("flaky", "misalign") else 0, 0)
+
+    def test_untranslated_lines_are_retried_on_other_engines(self):
+        texts = self.make_texts(60)
+        lazy = FakeEngine("lazy", mode="untranslated", threads=6)
+        good = FakeEngine("good", threads=1)
+        run = self.run_run([lazy, good], texts)
+        self.assertEqual(run.results(), [fake_tr(t) for t in texts])
+        self.assertGreater(run.retried, 0)
+
+    def test_everything_untranslated_is_reported_not_crashed(self):
+        texts = ["这是一句话。", "另一句话。"]
+        run = self.run_run([FakeEngine("l1", mode="untranslated"),
+                            FakeEngine("l2", mode="untranslated")], texts)
+        self.assertEqual(sorted(run.bad_indexes()), [0, 1])
+        self.assertEqual(run.results(), texts)
+
+    def test_rescue_pass_fixes_stubborn_lines(self):
+        long_line = "特" + "这是很长的一句话，" * 12
+        texts = [long_line, "短句子。"]
+        engines = [FakeEngine("s1", mode="stubborn"), FakeEngine("s2", mode="stubborn")]
+        run = self.run_run(engines, texts)
+        self.assertEqual(run.bad_indexes(), [0])
+        fixed = bot.rescue_pass(run, engines, "zh", threading.Event())
+        self.assertEqual(fixed, 1)
+        self.assertEqual(bot.leftover_score(long_line, run.results()[0]), 0.0)
+
+    def test_short_outage_does_not_produce_untranslated_lines(self):
+        texts = self.make_texts(80)
+        engines = [FakeEngine("n1", mode="outage"), FakeEngine("n2", mode="outage", threads=2),
+                   FakeEngine("n3", mode="outage", max_items=1)]
+        run = self.run_run(engines, texts)
+        self.assertEqual(run.results(), [fake_tr(t) for t in texts])
+        self.assertEqual(run.bad_indexes(), [])
+
+    def test_poison_line_cannot_block_the_others(self):
+        texts = self.make_texts(40)
+        texts[17] = "这一行有毒，引擎无法处理。"
+        engines = [FakeEngine("p1", mode="poison", max_items=10), FakeEngine("p2", mode="poison", max_items=10)]
+        run = self.run_run(engines, texts)
+        res = run.results()
+        self.assertEqual(run.bad_indexes(), [17])
+        self.assertEqual(res[17], texts[17])
+        for i, t in enumerate(texts):
+            if i != 17:
+                self.assertEqual(res[i], fake_tr(t))
+
+    def test_stall_raises(self):
+        run = bot.Run(["你好世界"], [FakeEngine("d", mode="dead")], "zh", threading.Event(), stall=1.5)
+        with self.assertRaises(bot.Stalled):
+            run.execute()
+
+    def test_cancel(self):
+        ev = threading.Event()
+        run = bot.Run(self.make_texts(50), [FakeEngine("d", mode="dead")], "zh", ev, stall=60)
+        threading.Timer(0.6, ev.set).start()
+        with self.assertRaises(bot.Cancelled):
+            run.execute()
+
+    def test_empty_run(self):
+        run = bot.Run([], [FakeEngine("a")], "zh", threading.Event())
+        run.execute()
+        self.assertEqual(run.results(), [])
+
+
+# ----------------------------------------------------------------- fake servers
+class FakeTranslateHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    log_message = lambda *a, **k: None
+
+    def _send(self, code, body, ctype="application/json"):
+        data = body if isinstance(body, bytes) else body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        sp = urllib.parse.urlsplit(self.path)
+        qs = urllib.parse.parse_qs(sp.query)
+        if sp.path == "/auth":
+            return self._send(200, "x" * 40, "text/plain")
+        if sp.path.startswith("/api/v1/"):  # lingva
+            text = urllib.parse.unquote(sp.path.split("/", 5)[5])
+            return self._send(200, json.dumps({"translation": fake_tr(text)}))
+        if sp.path == "/m":
+            text = qs["q"][0]
+            return self._send(200, "<html><div class=\"result-container\">%s</div></html>" %
+                              fake_tr(text).replace("\n", "<br>"), "text/html")
+        if sp.path == "/get":  # mymemory
+            return self._send(200, json.dumps({"responseData": {"translatedText": fake_tr(qs["q"][0])},
+                                               "responseStatus": 200}))
+        if sp.path == "/translate_a/single":
+            return self.google(qs["q"][0])
+        self._send(404, "no")
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(n)
+        sp = urllib.parse.urlsplit(self.path)
+        if sp.path == "/translate_a/single":
+            q = urllib.parse.parse_qs(body.decode("utf-8"))["q"][0]
+            return self.google(q)
+        if sp.path == "/translate":
+            if self.headers.get("Authorization", "").startswith("Bearer "):
+                items = json.loads(body.decode("utf-8"))
+                return self._send(200, json.dumps([{"translations": [{"text": fake_tr(i["Text"]), "to": "hi"}]}
+                                                   for i in items]))
+            return self._send(401, "{}")
+        self._send(404, "no")
+
+    def google(self, q):
+        segs = []
+        lines = q.split("\n")
+        for i, line in enumerate(lines):
+            suffix = "\n" if i < len(lines) - 1 else ""
+            segs.append([fake_tr(line) + suffix, line + suffix, None, None, 10])
+        self._send(200, json.dumps([segs, None, "zh-CN"]))
+
+
+class FakeTelegram:
+    """Tiny Bot API: one document update, records everything the bot does."""
+
+    def __init__(self, document_bytes, file_name, token="1234567:" + "A" * 30, extra_updates=None):
+        self.token = token
+        self.doc_bytes = document_bytes
+        self.file_name = file_name
+        self.sent_messages = []
+        self.edits = []
+        self.uploads = []
+        self.updates = [{"update_id": 1, "message": {
+            "message_id": 5, "chat": {"id": 777}, "document": {
+                "file_id": "FILE1", "file_name": file_name, "file_size": len(document_bytes),
+                "mime_type": "application/octet-stream"}}}]
+        if extra_updates:
+            self.updates += extra_updates
+        self.delivered = False
+        outer = self
+
+        class H(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+            log_message = lambda *a, **k: None
+
+            def _json(self, obj):
+                data = json.dumps(obj).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self):
+                if self.path == f"/file/bot{outer.token}/docs/file1":
+                    data = outer.doc_bytes
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                else:
+                    self.send_response(404)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(n)
+                method = self.path.rsplit("/", 1)[-1]
+                if not self.path.startswith(f"/bot{outer.token}/"):
+                    return self._json({"ok": False, "error_code": 401, "description": "Unauthorized"})
+                if method == "sendDocument":
+                    outer.uploads.append((self.headers.get("Content-Type"), body))
+                    return self._json({"ok": True, "result": {"message_id": 99}})
+                params = json.loads(body.decode() or "{}")
+                if method == "getMe":
+                    return self._json({"ok": True, "result": {"username": "fakebot"}})
+                if method == "deleteWebhook":
+                    return self._json({"ok": True, "result": True})
+                if method == "getUpdates":
+                    if not outer.delivered:
+                        outer.delivered = True
+                        return self._json({"ok": True, "result": outer.updates})
+                    time.sleep(0.3)
+                    return self._json({"ok": True, "result": []})
+                if method == "getFile":
+                    return self._json({"ok": True, "result": {"file_path": "docs/file1"}})
+                if method == "sendMessage":
+                    outer.sent_messages.append(params)
+                    return self._json({"ok": True, "result": {"message_id": 41}})
+                if method == "editMessageText":
+                    outer.edits.append(params)
+                    return self._json({"ok": True, "result": True})
+                if method == "answerCallbackQuery":
+                    return self._json({"ok": True, "result": True})
+                return self._json({"ok": False, "error_code": 404, "description": "unknown"})
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def uploaded_files(self):
+        """Parse our own multipart bodies -> {filename: bytes}"""
+        files = {}
+        for ctype, body in self.uploads:
+            boundary = ctype.split("boundary=")[1].encode()
+            for part in body.split(b"--" + boundary):
+                m = re.search(rb'filename="([^"]+)"\r\nContent-Type: [^\r]*\r\n\r\n', part)
+                if m:
+                    content = part[m.end():]
+                    if content.endswith(b"\r\n"):
+                        content = content[:-2]
+                    files[m.group(1).decode("utf-8")] = content
+        return files
+
+
+def make_epub(path, encoding="utf-8"):
+    chapters = {}
+    for i in range(1, 4):
+        body = "".join(f"<p>第{i}章 第{j}段 这是测试的内容，欢迎使用翻译机器人。Hello number {j}!</p>\n"
+                       for j in range(1, 40))
+        chapters[f"OEBPS/ch{i}.xhtml"] = (
+            f'<?xml version="1.0" encoding="{encoding}"?>\n'
+            '<html xmlns="http://www.w3.org/1999/xhtml" lang="zh"><head><title>章节</title></head>'
+            f"<body><h1>第{i}章</h1>\n{body}<pre>代码 一\n代码 二</pre></body></html>").encode(encoding)
+    opf = ('<?xml version="1.0" encoding="utf-8"?><package xmlns="http://www.idpf.org/2007/opf" version="2.0">'
+           '<metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>测试之书</dc:title>'
+           '<dc:language>zh</dc:language><dc:identifier id="id">urn:uuid:1</dc:identifier></metadata><manifest>'
+           '<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>'
+           '<item id="c1" href="ch1.xhtml" media-type="application/xhtml+xml"/>'
+           '<item id="c2" href="ch2.xhtml" media-type="application/xhtml+xml"/>'
+           '<item id="c3" href="ch3.xhtml" media-type="application/xhtml+xml"/>'
+           '<item id="img" href="cover.png" media-type="image/png"/></manifest>'
+           '<spine toc="ncx"><itemref idref="c1"/><itemref idref="c2"/><itemref idref="c3"/></spine></package>')
+    ncx = ('<?xml version="1.0" encoding="utf-8"?><ncx xmlns="http://www.daisy.org/z3986/2005/ncx/">'
+           '<docTitle><text>测试之书</text></docTitle><navMap><navPoint id="n1"><navLabel><text>第一章</text>'
+           '</navLabel><content src="ch1.xhtml"/></navPoint></navMap></ncx>')
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr(zipfile.ZipInfo("mimetype"), "application/epub+zip")
+        z.writestr("META-INF/container.xml",
+                   '<?xml version="1.0"?><container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" '
+                   'version="1.0"><rootfiles><rootfile full-path="OEBPS/content.opf" '
+                   'media-type="application/oebps-package+xml"/></rootfiles></container>')
+        z.writestr("OEBPS/content.opf", opf)
+        z.writestr("OEBPS/toc.ncx", ncx)
+        for name, data in chapters.items():
+            z.writestr(name, data)
+        z.writestr("OEBPS/cover.png", b"\x89PNG\r\n\x1a\n" + os.urandom(2000))
+
+
+class EngineParsingTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), FakeTranslateHandler)
+        cls.base = f"http://127.0.0.1:{cls.srv.server_address[1]}"
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+
+    def check(self, engine, texts=None):
+        texts = texts or ["你好，世界", "第二行 test & more", "第三行"]
+        want = [fake_tr(t) for t in texts]
+        got = engine.translate(texts, "zh")
+        self.assertEqual([g.strip() for g in got], want)
+        self.assertEqual(engine.translate(["单行"], "zh"), [fake_tr("单行")])
+
+    def test_google_post(self):
+        e = bot.GoogleEngine(base=self.base)
+        self.check(e)
+        self.assertTrue(e.use_post)
+
+    def test_google_get_fallback(self):
+        e = bot.GoogleEngine(base=self.base)
+        e.use_post = False
+        self.check(e)
+
+    def test_google_mobile(self):
+        self.check(bot.GoogleMobileEngine(base=self.base))
+
+    def test_bing(self):
+        self.check(bot.BingEngine(auth_url=self.base + "/auth", api_url=self.base + "/translate"))
+
+    def test_lingva(self):
+        self.check(bot.LingvaEngine(self.base))
+
+    def test_mymemory(self):
+        e = bot.MyMemoryEngine(base=self.base)
+        self.assertEqual(e.translate(["你好"], "zh"), [fake_tr("你好")])
+
+    def test_dead_host_raises_engine_error(self):
+        e = bot.GoogleEngine(base="http://127.0.0.1:9")
+        with self.assertRaises(bot.EngineError):
+            e.translate(["你好"], "zh")
+
+    def test_default_engine_list(self):
+        names = [e.name for e in bot.build_engines({})]
+        for n in ("google", "bing", "google-mobile", "yandex", "mymemory"):
+            self.assertIn(n, names)
+        self.assertTrue(any(n.startswith("lingva:") for n in names))
+        off = [e.name for e in bot.build_engines({"DISABLE_ENGINES": "yandex,mymemory"})]
+        self.assertNotIn("yandex", off)
+        self.assertNotIn("mymemory", off)
+
+
+class FileTests(unittest.TestCase):
+    def translate_all(self, proc, sl="zh"):
+        texts = proc.table.texts
+        run = bot.Run(texts, [FakeEngine("a"), FakeEngine("b")], sl, threading.Event())
+        run.execute()
+        return run.results()
+
+    def test_epub_roundtrip(self):
+        for enc in ("utf-8", "gb18030"):
+            with tempfile.TemporaryDirectory() as d:
+                src, out = os.path.join(d, "in.epub"), os.path.join(d, "out.epub")
+                make_epub(src, enc)
+                proc = bot.EpubProcessor(src)
+                proc.load()
+                self.assertGreater(len(proc.table.texts), 100)
+                proc.build(self.translate_all(proc), out)
+                with zipfile.ZipFile(out) as z:
+                    self.assertEqual(z.namelist()[0], "mimetype")
+                    self.assertEqual(z.getinfo("mimetype").compress_type, zipfile.ZIP_STORED)
+                    self.assertIsNone(z.testzip())
+                    ch1 = z.read("OEBPS/ch1.xhtml").decode("utf-8")
+                    self.assertIn('encoding="utf-8"', ch1)
+                    self.assertIn('lang="hi"', ch1)
+                    self.assertNotRegex(ch1, bot.CJK_RE)
+                    import xml.dom.minidom
+                    for n in ("OEBPS/ch1.xhtml", "OEBPS/ch2.xhtml", "OEBPS/toc.ncx", "OEBPS/content.opf"):
+                        xml.dom.minidom.parseString(z.read(n))
+                    self.assertIn("<dc:language>hi</dc:language>", z.read("OEBPS/content.opf").decode())
+                    self.assertNotIn("测试之书", z.read("OEBPS/content.opf").decode())
+                    self.assertNotIn("第一章", z.read("OEBPS/toc.ncx").decode())
+                    self.assertEqual(z.read("OEBPS/cover.png"), zipfile.ZipFile(src).read("OEBPS/cover.png"))
+                units = proc.scan_output(out)
+                flags = [bot.final_flag(u) for u in units]
+                self.assertNotIn("problem", flags)
+
+    def test_epub_final_scan_catches_untranslated(self):
+        with tempfile.TemporaryDirectory() as d:
+            src, out = os.path.join(d, "in.epub"), os.path.join(d, "out.epub")
+            make_epub(src)
+            proc = bot.EpubProcessor(src)
+            proc.load()
+            res = self.translate_all(proc)
+            res[5] = proc.table.texts[5]       # simulate one line left in Chinese
+            proc.build(res, out)
+            flags = [bot.final_flag(u) for u in proc.scan_output(out)]
+            self.assertIn("problem", flags)
+
+    def test_bad_epubs_give_friendly_errors(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "bad.epub")
+            with open(p, "wb") as f:
+                f.write(b"this is not a zip")
+            with self.assertRaises(bot.UserError):
+                bot.EpubProcessor(p).load()
+            p2 = os.path.join(d, "empty.epub")
+            with zipfile.ZipFile(p2, "w") as z:
+                z.writestr("mimetype", "application/epub+zip")
+                z.writestr("a.xhtml", "<html><body><p>12345</p></body></html>")
+            with self.assertRaises(bot.UserError):
+                bot.EpubProcessor(p2).load()
+            p3 = os.path.join(d, "drm.epub")
+            with zipfile.ZipFile(p3, "w") as z:
+                z.writestr("mimetype", "application/epub+zip")
+                z.writestr("META-INF/encryption.xml",
+                           '<encryption><EncryptedData><EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#aes128-cbc"/>'
+                           "</EncryptedData></encryption>")
+                z.writestr("a.xhtml", "<html><body><p>你好</p></body></html>")
+            with self.assertRaises(bot.UserError):
+                bot.EpubProcessor(p3).load()
+
+    def test_epub_without_opf_still_works(self):
+        with tempfile.TemporaryDirectory() as d:
+            p, out = os.path.join(d, "x.epub"), os.path.join(d, "y.epub")
+            with zipfile.ZipFile(p, "w") as z:
+                z.writestr("mimetype", "application/epub+zip")
+                z.writestr("a.xhtml", "<html><body><p>你好世界</p></body></html>")
+            proc = bot.EpubProcessor(p)
+            proc.load()
+            proc.build(self.translate_all(proc), out)
+            with zipfile.ZipFile(out) as z:
+                self.assertNotRegex(z.read("a.xhtml").decode(), bot.CJK_RE)
+
+    def test_txt_gbk_crlf(self):
+        with tempfile.TemporaryDirectory() as d:
+            src, out = os.path.join(d, "in.txt"), os.path.join(d, "out.txt")
+            lines = ["　　第一章 开始", "", "　　这是一个很长的句子。" * 300, "Hello world, this is English.", "12345", "  "]
+            with open(src, "wb") as f:
+                f.write("\r\n".join(lines).encode("gb18030"))
+            proc = bot.TxtProcessor(src)
+            proc.load()
+            proc.build(self.translate_all(proc), out)
+            with open(out, "rb") as f:
+                data = f.read().decode("utf-8")
+            out_lines = data.split("\r\n")
+            self.assertEqual(len(out_lines), len(lines))
+            self.assertTrue(out_lines[0].startswith("　　"))
+            self.assertEqual(out_lines[1], "")
+            self.assertEqual(out_lines[4], "12345")
+            self.assertEqual(out_lines[5], "  ")
+            self.assertNotRegex(data, bot.CJK_RE)
+            flags = [bot.final_flag(u) for u in proc.scan_output(out)]
+            self.assertNotIn("problem", flags)
+
+    def test_txt_split_when_too_big(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "o.txt")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("नमस्ते दुनिया\n" * 5)
+            old = bot.TG_UPLOAD_LIMIT
+            try:
+                bot.TG_UPLOAD_LIMIT = 10
+                proc = bot.TxtProcessor(p)
+                files = proc.outputs(p, "book")
+                self.assertGreaterEqual(len(files), 1)
+            finally:
+                bot.TG_UPLOAD_LIMIT = old
+
+
+class EndToEndTests(unittest.TestCase):
+    def setUp(self):
+        self.tsrv = ThreadingHTTPServer(("127.0.0.1", 0), FakeTranslateHandler)
+        self.tbase = f"http://127.0.0.1:{self.tsrv.server_address[1]}"
+        threading.Thread(target=self.tsrv.serve_forever, daemon=True).start()
+        bot.STOP.clear()
+
+    def tearDown(self):
+        self.tsrv.shutdown()
+        self.tsrv.server_close()
+        bot.STOP.clear()
+
+    def engines(self):
+        return [bot.GoogleEngine(base=self.tbase), bot.GoogleEngine("google-chrome", "dict-chrome-ex",
+                                                                    base=self.tbase, threads=3),
+                bot.BingEngine(auth_url=self.tbase + "/auth", api_url=self.tbase + "/translate"),
+                bot.GoogleMobileEngine(base=self.tbase), bot.LingvaEngine(self.tbase),
+                bot.MyMemoryEngine(base=self.tbase),
+                bot.GoogleEngine("broken", "gtx", base="http://127.0.0.1:9", threads=2)]
+
+    def run_bot(self, fake, wait_for_upload=True, timeout=60, extra=None):
+        tg = bot.TgClient(fake.token, fake.url)
+        b = bot.Bot(tg, self.engines())
+        t = threading.Thread(target=bot.poll_loop, args=(b, tg), daemon=True)
+        t.start()
+        end = time.time() + timeout
+        while time.time() < end:
+            if wait_for_upload and fake.uploads:
+                break
+            if not wait_for_upload and extra and extra():
+                break
+            time.sleep(0.2)
+        time.sleep(0.5)
+        bot.STOP.set()
+        b.shutdown()
+        t.join(timeout=60)
+        return b
+
+    def test_epub_end_to_end(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "novel.epub")
+            make_epub(src)
+            with open(src, "rb") as f:
+                data = f.read()
+            fake = FakeTelegram(data, "我的 novel.epub")
+            try:
+                self.run_bot(fake)
+                files = fake.uploaded_files()
+                self.assertEqual(list(files), ["我的 novel_hindi.epub"])
+                out = os.path.join(d, "o.epub")
+                with open(out, "wb") as f:
+                    f.write(files["我的 novel_hindi.epub"])
+                with zipfile.ZipFile(out) as z:
+                    self.assertIsNone(z.testzip())
+                    self.assertNotRegex(z.read("OEBPS/ch2.xhtml").decode("utf-8"), bot.CJK_RE)
+                final = fake.edits[-1]["text"]
+                self.assertIn("Done", final)
+                self.assertIn("No untranslated lines found", final)
+                joined = "\n".join(e["text"] for e in fake.edits)
+                self.assertIn("Used", joined)
+                self.assertNotIn(fake.token, joined)
+                self.assertTrue(any("█" in e["text"] or "░" in e["text"] for e in fake.edits + fake.sent_messages))
+            finally:
+                fake.close()
+
+    def test_txt_end_to_end(self):
+        text = "\n".join(f"第{i}行：这是测试内容。" for i in range(500)).encode("gb18030")
+        fake = FakeTelegram(text, "a.txt")
+        try:
+            self.run_bot(fake)
+            files = fake.uploaded_files()
+            self.assertEqual(list(files), ["a_hindi.txt"])
+            out = files["a_hindi.txt"].decode("utf-8")
+            self.assertEqual(len(out.split("\n")), 500)
+            self.assertNotRegex(out, bot.CJK_RE)
+        finally:
+            fake.close()
+
+    def test_wrong_type_and_too_big(self):
+        upd = [{"update_id": 2, "message": {"message_id": 6, "chat": {"id": 777}, "document": {
+            "file_id": "X", "file_name": "a.pdf", "file_size": 10}}},
+            {"update_id": 3, "message": {"message_id": 7, "chat": {"id": 777}, "document": {
+                "file_id": "Y", "file_name": "big.epub", "file_size": 16 * 1024 * 1024}}},
+            {"update_id": 4, "message": {"message_id": 8, "chat": {"id": 777}, "text": "/start"}},
+            {"update_id": 5, "message": {"message_id": 9, "chat": {"id": 777}, "text": "hello"}}]
+        fake = FakeTelegram(b"not used", "z.dat", extra_updates=upd)
+        fake.updates = upd
+        try:
+            self.run_bot(fake, wait_for_upload=False, timeout=15,
+                         extra=lambda: len(fake.sent_messages) >= 4)
+            texts = [m["text"] for m in fake.sent_messages]
+            self.assertTrue(any("only translate .epub and .txt" in t for t in texts))
+            self.assertTrue(any("limit is 15 MB" in t for t in texts))
+            self.assertTrue(any("Hindi Translate Bot" in t for t in texts))
+            self.assertTrue(any("send a .epub or .txt" in t for t in texts))
+        finally:
+            fake.close()
+
+    def test_broken_epub_gets_friendly_message(self):
+        fake = FakeTelegram(b"definitely not an epub", "bad.epub")
+        try:
+            self.run_bot(fake, wait_for_upload=False, timeout=20,
+                         extra=lambda: any("not a valid EPUB" in e["text"] for e in fake.edits))
+            self.assertTrue(any("not a valid EPUB" in e["text"] for e in fake.edits))
+        finally:
+            fake.close()
+
+    def test_cancel_button(self):
+        text = "\n".join(f"第{i}行：这是测试内容。" for i in range(3000)).encode("utf-8")
+        cb = {"update_id": 9, "callback_query": {"id": "cb1", "data": "c:NOPE", "message": {"chat": {"id": 777}}}}
+        fake = FakeTelegram(text, "slow.txt", extra_updates=[cb])
+        tg = bot.TgClient(fake.token, fake.url)
+        slow = FakeEngine("slow", threads=1, max_items=1)
+        orig = slow.translate
+
+        def slow_translate(texts, sl):
+            time.sleep(0.2)
+            return orig(texts, sl)
+        slow.translate = slow_translate
+        b = bot.Bot(tg, [slow])
+        t = threading.Thread(target=bot.poll_loop, args=(b, tg), daemon=True)
+        t.start()
+        try:
+            end = time.time() + 20
+            while time.time() < end and not b.jobs:
+                time.sleep(0.1)
+            self.assertTrue(b.jobs)
+            job = list(b.jobs.values())[0]
+            time.sleep(1.0)
+            b.on_callback({"id": "cb2", "data": f"c:{job.id}", "message": {"chat": {"id": 777}}})
+            end = time.time() + 20
+            while time.time() < end and not any("Cancelled" in e["text"] for e in fake.edits):
+                time.sleep(0.1)
+            self.assertTrue(any("Cancelled" in e["text"] for e in fake.edits))
+            self.assertEqual(fake.uploads, [])
+        finally:
+            bot.STOP.set()
+            b.shutdown()
+            t.join(timeout=30)
+            fake.close()
+
+
+if __name__ == "__main__":
+    unittest.main()
