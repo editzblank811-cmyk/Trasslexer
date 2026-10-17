@@ -36,7 +36,20 @@ docker run -d --restart always -e BOT_TOKEN="paste-your-token-here" hindi-bot
 
 Connect this GitHub repo, set start command `python bot.py`, add `BOT_TOKEN`. If the host gives a `PORT`, the bot opens a small health page on it automatically.
 
-> GitHub only stores the code. Do not run the bot on GitHub Actions runners; GitHub's terms do not allow using them as a bot server. The included `test.yml` workflow only runs the tests (put it at `.github/workflows/test.yml`).
+### Run it on GitHub itself (Actions)
+
+1. Make the repo **Public** (private repos only get 2000 free minutes a month, a bot needs far more).
+2. Repo **Settings → Secrets and variables → Actions → New repository secret**. Name: `BOT_TOKEN`, value: your token from BotFather.
+3. Put `run-bot.yml` at `.github/workflows/run-bot.yml` (Add file → Create new file, type that path).
+4. Open the **Actions** tab → **run-bot** → **Run workflow**. Done. The bot is online.
+
+How it keeps running: one run lasts about 5.5 hours. Then the bot stops taking new files, finishes the ones it is translating (up to 12 minutes), exits, and starts the next run by itself. An hourly schedule is a backup. Only one run is active at a time. Cancelled or waiting runs in the list are normal.
+
+Things to know:
+- GitHub's terms say Actions are meant for building and testing software, not for hosting a server. A bot like this can get a warning or be stopped by GitHub. If that happens, run it on your phone (Termux) or a free host instead; the same `bot.py` works everywhere.
+- Between two runs there can be a gap of a minute or two. Files sent in that gap wait in Telegram and are picked up when the next run starts.
+- If the bot ever stops (GitHub switches off schedules after 60 days without repo activity), just press **Run workflow** again.
+- If the token is wrong the run fails and does not restart in a loop. Fix the secret and press **Run workflow**.
 
 ## Optional settings
 
@@ -48,6 +61,7 @@ Connect this GitHub repo, set start command `python bot.py`, add `BOT_TOKEN`. If
 | `LIBRETRANSLATE_URLS` / `LIBRETRANSLATE_API_KEY` | Your own LibreTranslate server |
 | `MYMEMORY_EMAIL` | Raises the free MyMemory daily limit |
 | `STALL_SECONDS` | Give up if nothing translates for this long (default 240) |
+| `MAX_RUNTIME_MIN` / `DRAIN_MIN` | Stop after this many minutes and finish running files first (used by the GitHub workflow) |
 
 ## Limits
 
@@ -57,4 +71,4 @@ Connect this GitHub repo, set start command `python bot.py`, add `BOT_TOKEN`. If
 
 ## Tests
 
-`python -m unittest -v` runs 37 tests offline against fake servers.
+`python -m unittest -v` runs 38 tests offline against fake servers.
