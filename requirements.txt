@@ -1,0 +1,1 @@
+# No packages needed. The bot uses only the Python standard library (Python 3.9 or newer).
