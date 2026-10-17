@@ -1,0 +1,39 @@
+name: run-bot
+
+# Runs the Telegram bot on GitHub. One run lasts about 5.5 hours, then it
+# finishes the files it is working on, stops, and starts the next run by itself.
+# The hourly schedule is only a backup in case the chain ever breaks.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 * * * *"
+
+# Only one bot may run at a time (two would fight over the same Telegram token).
+# A newer run waits until the old one is finished.
+concurrency:
+  group: hindi-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run the bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          MAX_RUNTIME_MIN: "330"
+          DRAIN_MIN: "12"
+        run: python3 -u bot.py
+
+      - name: Start the next run
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run run-bot.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"
