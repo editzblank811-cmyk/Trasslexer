@@ -12,6 +12,12 @@ Hindi Translate Bot for Telegram  (EPUB + TXT, Chinese or English -> Hindi)
 * Every translated line is checked; lines that still look untranslated are
   retried on other engines, then split into smaller pieces and retried again,
   and the finished file is scanned one last time.
+
+PATCHES (v1.0.1):
+* Run.salvage(): when the run stalls but >= 90% is translated, the unfinished
+  lines keep their best/original text and the file is still built and sent.
+* leftover_score(): short names / words that an engine returns unchanged are
+  no longer treated as "untranslated" (stops endless retries on names).
 """
 from __future__ import annotations
 
@@ -40,7 +46,7 @@ import zipfile
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 # --------------------------------------------------------------------------
 # Settings
@@ -54,6 +60,7 @@ MAX_JOBS = max(1, int(os.environ.get("MAX_JOBS", "2")))
 ZIP_MAX_ENTRIES = 30000
 ZIP_MAX_UNPACKED = 600 * 1024 * 1024
 SCAN_LIMIT = 400
+SALVAGE_MIN_FRACTION = 0.90                # on stall, send the file if at least this much is done
 TARGET = "hi"
 UA = ("Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36")
@@ -344,6 +351,13 @@ def leftover_score(src, out):
     out = out.strip()
     if not out:
         return 1.0
+    # PATCH: a short Latin name / word that comes back unchanged is fine
+    # (names like "Ryan", "Chapter 1"). Do not retry these forever.
+    s = src.strip()
+    if (len(s) <= 20 and not CJK_RE.search(s)
+            and len(LATIN_WORD_RE.findall(s)) <= 2
+            and out.lower() == s.lower()):
+        return 0.0
     score = 0.0
     s_cjk = len(CJK_RE.findall(src))
     o_cjk = len(CJK_RE.findall(out))
@@ -1448,6 +1462,19 @@ class Run:
         finally:
             self.stop.set()
 
+    # PATCH: give up on unfinished lines instead of throwing the whole job away.
+    def salvage(self):
+        """Mark every unfinished line as 'bad' and keep its best (or original) text.
+        Returns how many lines were given up on."""
+        n = 0
+        with self.lock:
+            for it in self.items:
+                if not it.done:
+                    it.bad = True
+                    self._finalize(it, it.best if it.best is not None else it.text)
+                    n += 1
+        return n
+
     def results(self):
         return [(it.result if it.result is not None else it.text) for it in self.items]
 
@@ -1837,7 +1864,17 @@ class Job:
         self.tr_start = time.time()
         self.phase = "translate"
         self.push(force=True)
-        run.execute()
+
+        # PATCH: if the services stall near the end, do not throw everything away.
+        salvaged = 0
+        try:
+            run.execute()
+        except Stalled:
+            if run.done_chars < SALVAGE_MIN_FRACTION * run.total_chars:
+                raise
+            salvaged = run.salvage()
+            log.warning("stalled at %.1f%%, salvaged %d unfinished lines",
+                        100.0 * run.done_chars / run.total_chars, salvaged)
         self.check_cancel()
 
         self.phase = "rescue"
@@ -1891,6 +1928,9 @@ class Job:
             caption.append(f"⚠️ {fmt_n(len(problems))} lines may still have untranslated words (list attached)")
         else:
             caption.append("✔️ No untranslated lines found")
+        if salvaged:
+            caption.append(f"⚠️ The translate services stopped answering near the end, "
+                           f"{fmt_n(salvaged)} lines were left as they were")
         if fixed:
             caption.append(f"🔎 {fmt_n(fixed)} stubborn lines fixed in a second pass")
         if engines_txt:
